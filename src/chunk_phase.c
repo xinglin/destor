@@ -93,6 +93,7 @@ static void* rabin_chunk_thread(void *arg) {
 			leftlen -= new_chunk->length;
 			left_offset += new_chunk->length;
 
+			/* check whether it is a zero chunk */
 			if (memcmp(zeros, new_chunk->data, new_chunk->length) == 0) {
 				jcr->zero_chunk_count++;
 				jcr->zero_chunk_amount += new_chunk->length;

@@ -3,6 +3,9 @@
  *  
  *  Created on: Dec 9, 2012
  *      Author: fumin
+ *
+ *  Ideally, these options should be put in a config file, read and parse
+ *  it to get these values.
  */
 
 #include "global.h"
