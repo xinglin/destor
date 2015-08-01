@@ -8,61 +8,62 @@
 #ifndef Jcr_H_
 #define Jcr_H_
 
-#include "global.h"
-#include "job/jobmanage.h"
-#include "dedup.h"
-#include "tools/sync_queue.h"
-#include "storage/protos.h"
+#include "destor.h"
+#include "recipe/recipestore.h"
 
-typedef struct jcr Jcr;
+#define JCR_STATUS_INIT 1
+#define JCR_STATUS_RUNNING 2
+#define JCR_STATUS_DONE 3
+
 /* job control record */
-struct jcr {
-	int32_t job_id;
-	char backup_path[200];
-	char restore_path[200];
+struct jcr{
+	int32_t id;
+	/*
+	 * The path of backup or restore.
+	 */
+	sds path;
+
+    int status;
+
 	int32_t file_num;
-	int64_t dedup_size;
-	int64_t job_size;
+	int64_t data_size;
+	int64_t unique_data_size;
 	int32_t chunk_num;
-	int32_t number_of_dup_chunks;
-	int32_t zero_chunk_count;
-	int64_t zero_chunk_amount;
-	int32_t rewritten_chunk_count;
-	int64_t rewritten_chunk_amount;
-	double time;
+	int32_t unique_chunk_num;
+	int32_t zero_chunk_num;
+	int64_t zero_chunk_size;
+	int32_t rewritten_chunk_num;
+	int64_t rewritten_chunk_size;
 
 	int32_t sparse_container_num;
 	int32_t inherited_sparse_num;
 	int32_t total_container_num;
 
-	JobVolume *job_volume;
+	struct backupVersion* bv;
 
-	SyncQueue *completed_files_queue;
-	SyncQueue *waiting_files_queue;
-
-	ContainerCache *read_cache;
-	OptimalContainerCache *read_opt_cache;
-	Container *asm_buffer;
-	BOOL enable_data_cache;
-	int32_t read_cache_size;
-	GHashTable* historical_sparse_containers;
+	double total_time;
 	/*
 	 * the time consuming of six dedup phase
 	 */
-
 	double read_time;
 	double chunk_time;
-	double name_time;
+	double hash_time;
+	double dedup_time;
+	double rewrite_time;
 	double filter_time;
 	double write_time;
-	//double update_time;
-	double test_time;
 
+	double read_recipe_time;
 	double read_chunk_time;
-	double write_file_time;
+	double write_chunk_time;
+
+	int32_t read_container_num;
 };
 
-Jcr* new_write_jcr();
-Jcr* new_read_jcr(int32_t rcs, BOOL edc);
-void free_jcr(Jcr*);
+extern struct jcr jcr;
+
+void init_jcr(char *path);
+void init_backup_jcr(char *path);
+void init_restore_jcr(int revision, char *path);
+
 #endif /* Jcr_H_ */

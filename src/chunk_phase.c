@@ -1,131 +1,183 @@
-#include "global.h"
-#include "dedup.h" 
+#include "destor.h"
 #include "jcr.h"
-#include "tools/rabin_chunking.h"
-#include "tools/sync_queue.h"
+#include "chunking/chunking.h"
+#include "backup.h"
+#include "storage/containerstore.h"
 
-extern int recv_data(DataBuffer** data_buffer);
-extern int chunking_algorithm;
-
-/* chunk_size must be a power of 2 */
-uint32_t chunk_size = 8192;
-uint32_t max_chunk_size = 65536;
-uint32_t min_chunk_size = 1024;
-
-/* chunk queue */
-static SyncQueue* chunk_queue;
 static pthread_t chunk_t;
+static int64_t chunk_num;
 
-static int64_t chunk_num = 0;
-static double total_size = 0;
+static int (*chunking)(unsigned char* buf, int size);
 
-static void send_chunk(Chunk* chunk) {
-	sync_queue_push(chunk_queue, chunk);
+static inline int fixed_chunk_data(unsigned char* buf, int size){
+	return destor.chunk_avg_size > size ? size : destor.chunk_avg_size;
 }
 
-static void signal_chunk(int signal) {
-	Chunk *chunk = allocate_chunk();
-	chunk->length = signal;
-	sync_queue_push(chunk_queue, chunk);
-}
-
-int recv_chunk(Chunk **new_chunk) {
-	Chunk *chunk = sync_queue_pop(chunk_queue);
-	if (chunk->length == FILE_END) {
-		/*free_chunk(chunk);*/
-		*new_chunk = chunk;
-		return FILE_END;
-	} else if (chunk->length == STREAM_END) {
-		/*free_chunk(chunk);*/
-		*new_chunk = chunk;
-		return STREAM_END;
-	}
-	*new_chunk = chunk;
-	return SUCCESS;
-}
-
-static void* rabin_chunk_thread(void *arg) {
+/*
+ * chunk-level deduplication.
+ * Destor currently supports fixed-sized chunking and (normalized) rabin-based chunking.
+ */
+static void* chunk_thread(void *arg) {
 	int leftlen = 0;
-	int left_offset = 0;
-	unsigned char leftbuf[READ_BUFFER_SIZE + max_chunk_size];
-	int signal = 0;
+	int leftoff = 0;
+	unsigned char *leftbuf = malloc(DEFAULT_BLOCK_SIZE + destor.chunk_max_size);
 
-	Jcr *jcr = (Jcr*) arg;
+	unsigned char *zeros = malloc(destor.chunk_max_size);
+	bzero(zeros, destor.chunk_max_size);
+	unsigned char *data = malloc(destor.chunk_max_size);
 
-	char zeros[max_chunk_size];
-	bzero(zeros, max_chunk_size);
-	while (TRUE) {
-		Chunk *new_chunk = allocate_chunk();
+	struct chunk* c = NULL;
 
-		if (signal >= 0 && leftlen < max_chunk_size) {
-			DataBuffer *data_buffer = NULL;
-			signal = recv_data(&data_buffer);
-			/* save this signal */
-			if (signal == SUCCESS) {
-				memmove(leftbuf, leftbuf + left_offset, leftlen);
-				left_offset = 0;
-				memcpy(leftbuf + leftlen, data_buffer->data, data_buffer->size);
-				leftlen += data_buffer->size;
-			}
-			free(data_buffer);
+	while (1) {
+
+		/* Try to receive a CHUNK_FILE_START. */
+		c = sync_queue_pop(read_queue);
+
+		if (c == NULL) {
+			sync_queue_term(chunk_queue);
+			break;
 		}
 
-		if (leftlen > 0) {
-			TIMER_DECLARE(b, e);
-			TIMER_BEGIN(b);
+		assert(CHECK_CHUNK(c, CHUNK_FILE_START));
+		sync_queue_push(chunk_queue, c);
 
-			if (chunking_algorithm == RABIN_CHUNK
-					|| chunking_algorithm == NRABIN_CHUNK)
-				new_chunk->length = rabin_chunk_data(leftbuf + left_offset,
-						leftlen);
-			else if (chunking_algorithm == FIXED_CHUNK)
-				new_chunk->length = chunk_size > leftlen ? leftlen : chunk_size;
-			else
-				dprint("Unknown chunking algorithm!");
+		/* Try to receive normal chunks. */
+		c = sync_queue_pop(read_queue);
+		if (!CHECK_CHUNK(c, CHUNK_FILE_END)) {
+			memcpy(leftbuf, c->data, c->size);
+			leftlen += c->size;
+			free_chunk(c);
+			c = NULL;
+		}
 
-			chunk_num++;
-			total_size += new_chunk->length;
-
-			TIMER_END(jcr->chunk_time, b, e);
-
-			new_chunk->data = (unsigned char*) malloc(new_chunk->length);
-			memcpy(new_chunk->data, leftbuf + left_offset, new_chunk->length);
-			leftlen -= new_chunk->length;
-			left_offset += new_chunk->length;
-
-			/* check whether it is a zero chunk */
-			if (memcmp(zeros, new_chunk->data, new_chunk->length) == 0) {
-				jcr->zero_chunk_count++;
-				jcr->zero_chunk_amount += new_chunk->length;
+		while (1) {
+			/* c == NULL indicates more data for this file can be read. */
+			while ((leftlen < destor.chunk_max_size) && c == NULL) {
+				c = sync_queue_pop(read_queue);
+				if (!CHECK_CHUNK(c, CHUNK_FILE_END)) {
+					memmove(leftbuf, leftbuf + leftoff, leftlen);
+					leftoff = 0;
+					memcpy(leftbuf + leftlen, c->data, c->size);
+					leftlen += c->size;
+					free_chunk(c);
+					c = NULL;
+				}
 			}
 
-			send_chunk(new_chunk);
-		} else {
-			if (signal == FILE_END) {
-				leftlen = 0;
-				left_offset = 0;
-				signal = 0;
-				windows_reset();
-				free(new_chunk);
-				signal_chunk(FILE_END);
-			} else if (signal == STREAM_END) {
-				free(new_chunk);
-				signal_chunk(STREAM_END);
+			if (leftlen == 0) {
+				assert(c);
 				break;
 			}
+
+			TIMER_DECLARE(1);
+			TIMER_BEGIN(1);
+
+			int	chunk_size = chunking(leftbuf + leftoff, leftlen);
+
+			TIMER_END(1, jcr.chunk_time);
+
+			struct chunk *nc = new_chunk(chunk_size);
+			memcpy(nc->data, leftbuf + leftoff, chunk_size);
+			leftlen -= chunk_size;
+			leftoff += chunk_size;
+
+			if (memcmp(zeros, nc->data, chunk_size) == 0) {
+				VERBOSE("Chunk phase: %ldth chunk  of %d zero bytes",
+						chunk_num++, chunk_size);
+				jcr.zero_chunk_num++;
+				jcr.zero_chunk_size += chunk_size;
+			} else
+				VERBOSE("Chunk phase: %ldth chunk of %d bytes", chunk_num++,
+						chunk_size);
+
+			sync_queue_push(chunk_queue, nc);
 		}
+
+		sync_queue_push(chunk_queue, c);
+		leftoff = 0;
+		c = NULL;
+
+		if(destor.chunk_algorithm == CHUNK_RABIN ||
+				destor.chunk_algorithm == CHUNK_NORMALIZED_RABIN)
+			windows_reset();
+
 	}
-	printf("chunk phase is finished:\nchunk_num=%ld, avg_chunk_size=%.3f\n",
-			chunk_num, total_size / chunk_num);
-	return NULL ;
+
+	free(leftbuf);
+	free(zeros);
+	free(data);
+	return NULL;
 }
 
-int start_chunk_phase(Jcr* jcr) {
-	chunkAlg_init();
+
+
+void start_chunk_phase() {
+
+	if (destor.chunk_algorithm == CHUNK_RABIN){
+		int pwr;
+		for (pwr = 0; destor.chunk_avg_size; pwr++) {
+			destor.chunk_avg_size >>= 1;
+		}
+		destor.chunk_avg_size = 1 << (pwr - 1);
+
+		assert(destor.chunk_avg_size >= destor.chunk_min_size);
+		assert(destor.chunk_avg_size <= destor.chunk_max_size);
+		assert(destor.chunk_max_size <= CONTAINER_SIZE - CONTAINER_META_SIZE);
+
+		chunkAlg_init();
+		chunking = rabin_chunk_data;
+	}else if(destor.chunk_algorithm == CHUNK_NORMALIZED_RABIN){
+		int pwr;
+		for (pwr = 0; destor.chunk_avg_size; pwr++) {
+			destor.chunk_avg_size >>= 1;
+		}
+		destor.chunk_avg_size = 1 << (pwr - 1);
+
+		assert(destor.chunk_avg_size >= destor.chunk_min_size);
+		assert(destor.chunk_avg_size <= destor.chunk_max_size);
+		assert(destor.chunk_max_size <= CONTAINER_SIZE - CONTAINER_META_SIZE);
+
+		chunkAlg_init();
+		chunking = normalized_rabin_chunk_data;
+	}else if(destor.chunk_algorithm == CHUNK_TTTD){
+		int pwr;
+		for (pwr = 0; destor.chunk_avg_size; pwr++) {
+			destor.chunk_avg_size >>= 1;
+		}
+		destor.chunk_avg_size = 1 << (pwr - 1);
+
+		assert(destor.chunk_avg_size >= destor.chunk_min_size);
+		assert(destor.chunk_avg_size <= destor.chunk_max_size);
+		assert(destor.chunk_max_size <= CONTAINER_SIZE - CONTAINER_META_SIZE);
+
+		chunkAlg_init();
+		chunking = tttd_chunk_data;
+	}else if(destor.chunk_algorithm == CHUNK_FIXED){
+		assert(destor.chunk_avg_size <= CONTAINER_SIZE - CONTAINER_META_SIZE);
+
+		destor.chunk_max_size = destor.chunk_avg_size;
+		chunking = fixed_chunk_data;
+	}else if(destor.chunk_algorithm == CHUNK_FILE){
+		/*
+		 * approximate file-level deduplication
+		 * It splits the stream according to file boundaries.
+		 * For a larger file, we need to split it due to container size limit.
+		 * Hence, our approximate file-level deduplication are only for files smaller than CONTAINER_SIZE - CONTAINER_META_SIZE.
+		 * Similar to fixed-sized chunking of $(( CONTAINER_SIZE - CONTAINER_META_SIZE )) chunk size.
+		 * */
+		destor.chunk_avg_size = CONTAINER_SIZE - CONTAINER_META_SIZE;
+		destor.chunk_max_size = CONTAINER_SIZE - CONTAINER_META_SIZE;
+		chunking = fixed_chunk_data;
+	}else{
+		NOTICE("Invalid chunking algorithm");
+		exit(1);
+	}
+
 	chunk_queue = sync_queue_new(100);
-	pthread_create(&chunk_t, NULL, rabin_chunk_thread, jcr);
+	pthread_create(&chunk_t, NULL, chunk_thread, NULL);
 }
 
 void stop_chunk_phase() {
-	pthread_join(chunk_t, NULL );
+	pthread_join(chunk_t, NULL);
+	NOTICE("chunk phase stops successfully!");
 }

@@ -9,29 +9,36 @@
 #ifndef INDEX_H_
 #define INDEX_H_
 
-#include "../global.h"
-#include "../dedup.h"
+#include "../destor.h"
+
 /*
  * The function is used to initialize memory structures of a fingerprint index.
  */
-BOOL index_init();
+void init_index();
 /*
  * Free memory structures and flush them into disks.
  */
-void index_destroy();
+void close_index();
 /*
- * Search in Fingerprint Index.
- * Return TMP_CONTAINER_ID if not exist.
- * Return old ContainerId if exist.
+ * lookup fingerprints in a segment in index.
  */
-ContainerId index_search(Fingerprint* finger, EigenValue *eigenvalue);
+int index_lookup(struct segment*);
 /*
- * Insert fingerprint into Index for new fingerprint or new ContainerId.
+ * Insert/update fingerprints.
  */
-void index_update(Fingerprint*, ContainerId, EigenValue* eigenvalue,
-		BOOL update);
+void index_update(GHashTable *features, int64_t id);
 
-EigenValue* extract_eigenvalue_exbin(Chunk *chunk);
-EigenValue* extract_eigenvalue_sparse(Chunk* chunk);
-EigenValue* extract_eigenvalue_silo(Chunk *chunk);
+void index_delete(fingerprint *fp, int64_t id);
+
+void index_check_buffer(struct segment *s);
+int index_update_buffer(struct segment *s);
+
+//void index_delete(fingerprint *);
+
+extern GHashTable* (*sampling)(GSequence *chunks, int32_t chunk_num);
+extern struct segment* (*segmenting)(struct chunk *c);
+
+gboolean g_feature_equal(char* a, char* b);
+guint g_feature_hash(char *feature);
+
 #endif
