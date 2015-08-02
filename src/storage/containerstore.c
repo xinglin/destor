@@ -5,6 +5,10 @@
 
 static int64_t container_count = 0;
 static FILE* fp;
+
+/* file descriptor to make data durable in storage */
+static int fd=-1;
+
 /* Control the concurrent accesses to fp. */
 static pthread_mutex_t mutex;
 
@@ -56,6 +60,10 @@ void init_container_store() {
 		exit(1);
 	}
 
+	if( (fd = fileno(fp)) < 0) {
+		perror("error in fileno().");
+	}
+
 	sdsfree(containerfile);
 
 	container_buffer = sync_queue_new(25);
@@ -68,6 +76,7 @@ void init_container_store() {
 }
 
 void close_container_store() {
+	int ret = 0;
 	sync_queue_term(container_buffer);
 
 	pthread_join(append_t, NULL);
@@ -75,6 +84,10 @@ void close_container_store() {
 
 	fseek(fp, 0, SEEK_SET);
 	fwrite(&container_count, sizeof(container_count), 1, fp);
+	
+	if( (ret = fsync(fd)) < 0){
+		perror("error in fsync in closing the container store.");
+	}
 
 	fclose(fp);
 	fp = NULL;
@@ -128,7 +141,7 @@ void write_container_async(struct container* c) {
  * Called by Append phase
  */
 void write_container(struct container* c) {
-
+	int ret = 0;
 	assert(c->meta.chunk_num == g_hash_table_size(c->meta.map));
 
 	if (container_empty(c)) {
@@ -212,6 +225,10 @@ void write_container(struct container* c) {
 		pthread_mutex_unlock(&mutex);
 	}
 
+	/* call fsync() to make data durable in storage */
+	if( (ret=fsync(fd)) < 0) {
+		perror("error in fsync for writing a container.");
+	}
 }
 
 struct container* retrieve_container_by_id(containerid id) {
